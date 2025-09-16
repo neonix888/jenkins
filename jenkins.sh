@@ -178,15 +178,91 @@ remove_existing_container() {
 }
 
 install_plugins() {
-  if [[ -n "${plugins:-}" ]]; then
-    log_info "Installing plugins: ${plugins}"
-    docker exec -u 0 jenkins bash -c "
-      curl -sSL http://localhost:8080/jnlpJars/jenkins-cli.jar -o /tmp/jenkins-cli.jar &&
-      java -jar /tmp/jenkins-cli.jar -s http://localhost:8080/ -auth ${admin_user}:${admin_password} install-plugin ${plugins//,/ } &&
-      java -jar /tmp/jenkins-cli.jar -s http://localhost:8080/ -auth ${admin_user}:${admin_password} safe-restart
-    "
+  if [[ -z "${plugins:-}" ]]; then
+    log_info "No plugins requested."
+    return
+  fi
+
+  local plugin_list="${plugins//,/ }"
+  log_info "Installing plugins with jenkins-plugin-cli: ${plugin_list}"
+
+  # Sanity: container exists?
+  if ! docker ps --format '{{.Names}}' | grep -qx jenkins; then
+    log_error "Container 'jenkins' not found. Did Terraform start it?"
+    return 1
+  fi
+
+  # Run as the jenkins user (uid:gid 1000). Ensure Java is on PATH for that user.
+  docker exec -u 1000:1000 jenkins bash -lc '
+    set -euo pipefail
+    # Put likely Java locations on PATH for this non-login shell
+    export PATH="/opt/java/openjdk/bin:/usr/local/openjdk-17/bin:$PATH"
+
+    if ! command -v java >/dev/null 2>&1; then
+      echo "[ERROR] java not found in PATH inside container." >&2
+      echo "        Checked /opt/java/openjdk/bin and /usr/local/openjdk-17/bin." >&2
+      exit 1
+    fi
+
+    if ! command -v jenkins-plugin-cli >/dev/null 2>&1; then
+      echo "[ERROR] jenkins-plugin-cli not found in container. Are you using jenkins/jenkins:lts?" >&2
+      exit 1
+    fi
+
+    mkdir -p /var/jenkins_home/plugins
+    jenkins-plugin-cli --plugins '"${plugin_list}"'
+  '
+
+  log_info "Restarting Jenkins container to load plugins..."
+  docker restart jenkins >/dev/null
+
+  # Optional: wait briefly, then verify
+  sleep 3
+  verify_plugins
+}
+
+
+verify_plugins() {
+  [[ -z "${plugins:-}" ]] && return
+
+  # Get installed plugin IDs by listing *.jpi under JENKINS_HOME/plugins
+  local installed
+  installed="$(docker exec -u 1000:1000 jenkins bash -lc 'ls -1 /var/jenkins_home/plugins 2>/dev/null | sed -n "s/\.jpi$//p"')"
+
+  # Normalize requested list (strip any :version suffix)
+  local missing=() present=() req p
+  for req in ${plugins//,/ }; do
+    p="${req%%:*}"         # strip :version if provided
+    if grep -qx "$p" <<<"$installed"; then
+      present+=("$p")
+    else
+      missing+=("$p")
+    fi
+  done
+
+  log_info "Plugins present:"
+  for p in "${present[@]}"; do echo "  - $p"; done
+
+  if ((${#missing[@]})); then
+    log_warn "Plugins missing:"
+    for p in "${missing[@]}"; do echo "  - $p"; done
+    return 1
+  else
+    log_success "All requested plugins are installed."
   fi
 }
+
+
+#install_plugins() {
+#  if [[ -n "${plugins:-}" ]]; then
+#    log_info "Installing plugins: ${plugins}"
+#    docker exec -u 0 jenkins bash -c "
+#      curl -sSL http://localhost:8080/jnlpJars/jenkins-cli.jar -o /tmp/jenkins-cli.jar &&
+#      java -jar /tmp/jenkins-cli.jar -s http://localhost:8080/ -auth ${admin_user}:${admin_password} install-plugin ${plugins//,/ } &&
+#      java -jar /tmp/jenkins-cli.jar -s http://localhost:8080/ -auth ${admin_user}:${admin_password} safe-restart
+#    "
+#  fi
+#}
 
 start_jenkins() {
   log_info "Starting Jenkins setup..."
@@ -205,6 +281,7 @@ start_jenkins() {
   log_info "Admin credentials: ${admin_user} / ${admin_password}"
 
   install_plugins
+  verify_plugins
 }
 
 stop_jenkins() {
